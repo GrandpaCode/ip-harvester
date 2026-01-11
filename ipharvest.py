@@ -2,17 +2,16 @@ import requests
 import socket
 import sys
 import os
-import csv
+import json
 from datetime import datetime
 
 def get_subdomains(target_domain):
-    """Fetch subdomains using the Certspotter API."""
+    """Fetch subdomains from Certspotter API."""
     url = f"https://api.certspotter.com/v1/issuances?domain={target_domain}&include_subdomains=true&expand=dns_names"
     try:
         response = requests.get(url, timeout=20)
         response.raise_for_status()
         data = response.json()
-        
         found_domains = set()
         for entry in data:
             for name in entry.get('dns_names', []):
@@ -25,16 +24,15 @@ def get_subdomains(target_domain):
         return []
 
 def enumerate_ips(domain):
-    """Returns a list of all unique IPs (v4) associated with a domain."""
+    """Enumerate all IPv4 addresses for a domain."""
     ips = set()
     try:
-        # AF_INET restricts to IPv4; change to AF_UNSPEC for both v4 and v6
         results = socket.getaddrinfo(domain, None, socket.AF_INET)
         for res in results:
             ips.add(res[4][0])
     except (socket.gaierror, socket.timeout):
         pass 
-    return list(ips)
+    return sorted(list(ips))
 
 def main():
     if len(sys.argv) < 2:
@@ -42,35 +40,74 @@ def main():
         sys.exit(1)
 
     root_domain = sys.argv[1].lower()
-    timestamp = datetime.now().strftime('%m/%d/%Y')
-    final_output = f"ipharvest.csv"
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    output_file = f"{root_domain}_db.json"
+    
+    # Slotted history for (N, N-1) support
+    MAX_HISTORY = 2 
+    
+    # Initialize or Load Database
+    db = {
+        "metadata": {"last_id": 0, "root_domain": root_domain, "updated": timestamp},
+        "index": {}, 
+        "history": {} 
+    }
 
-    print(f"Step 1: Discovering subdomains for {root_domain}...")
+    if os.path.exists(output_file):
+        with open(output_file, 'r') as f:
+            try:
+                db = json.load(f)
+            except json.JSONDecodeError:
+                pass
+
+    print(f"[*] Starting harvest for {root_domain}...")
     subdomains = get_subdomains(root_domain)
+    current_id = db["metadata"].get("last_id", 0)
 
-    if subdomains:
-        print(f"Step 2: Enumerating IPs for {len(subdomains)} subdomains...")
-        file_exists = os.path.isfile(final_output)
+    for sub in subdomains:
+        new_ips = enumerate_ips(sub)
+        if not new_ips:
+            continue
 
-        with open(final_output, "a", newline='') as csvfile:
-            writer = csv.writer(csvfile)
+        # Get existing state from Index
+        previous_entry = db["index"].get(sub, {})
+        previous_ips = previous_entry.get("ips", [])
+
+        # Only record if the IP pool has actually changed
+        if set(new_ips) != set(previous_ips):
+            current_id += 1
+            record = {
+                "id": current_id,
+                "subdomain": sub,
+                "timestamp": timestamp,
+                "ips": new_ips
+            }
+
+            # Update Index (Current State)
+            db["index"][sub] = record
+
+            # Update History (Sliding Window for N, N-1)
+            if sub not in db["history"]:
+                db["history"][sub] = []
             
-            if not file_exists:
-                writer.writerow(["Date", "RootDomain", "Subdomain", "IP"])
+            db["history"][sub].append(record)
             
-            for sub in subdomains:
-                ip_list = enumerate_ips(sub)
-                
-                if ip_list:
-                    for ip in ip_list:
-                        writer.writerow([timestamp, root_domain, sub, ip])
-                else:
-                    # Log as unresolved so you know the domain was found but didn't respond
-                    writer.writerow([timestamp, root_domain, sub, "0.0.0.0"])
-        
-        print(f"Success: History updated at {final_output}")
-    else:
-        print("Discovery failed or returned no results.")
+            # Enforce (N, N-1) bloat control
+            if len(db["history"][sub]) > MAX_HISTORY:
+                db["history"][sub] = db["history"][sub][-MAX_HISTORY:]
+            
+            print(f" [+] Change detected: {sub} (ID: {current_id})")
+
+    # Update Global Metadata
+    db["metadata"]["last_id"] = current_id
+    db["metadata"]["updated"] = timestamp
+
+    # Atomic Save
+    with open(output_file + ".tmp", 'w') as f:
+        json.dump(db, f, indent=4)
+    os.replace(output_file + ".tmp", output_file)
+
+    print(f"[*] Update complete. Database saved to {output_file}")
 
 if __name__ == "__main__":
     main()
